@@ -4,7 +4,6 @@ import logging
 import re
 from dataclasses import dataclass, fields, astuple
 from typing import Final
-
 import httpx
 
 # --- 1. 配置模块 ---
@@ -33,13 +32,14 @@ FILE_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"(?:CH|ch|NP|np)\d{4}")
 class StudentForm:
     """用于存储单个角色形态结构化数据的类"""
     file_id: str
+    name: str
+    skin_name: str
+    kivo_wiki_id: int
     name_cn: str
     name_jp: str
     name_tw: str
     name_en: str
     name_kr: str
-    skin_name: str
-    kivo_wiki_id: int
 
 
 @dataclass
@@ -87,7 +87,9 @@ class DataParser:
             return False
 
         char_datas = json_data['data'].get('character_datas')
-        if not char_datas or not isinstance(char_datas, list) or not char_datas[0].get('dev_name'):
+        # 记录必须包含 character_datas 字段且其类型为列表。
+        # 原有的 dev_name 检查过于严格，会导致一些有效的 NPC 数据被跳过。
+        if not isinstance(char_datas, list):
             return False
         return True
 
@@ -150,12 +152,26 @@ class DataParser:
         results: list[StudentForm] = []
         processed_file_ids: set[str] = set()
 
-        # 提取通用名称信息
-        name_cn = self._build_name(data.get("family_name_cn"), data.get("given_name_cn"))
-        name_jp = self._build_name(data.get("family_name_jp"), data.get("given_name_jp"))
-        name_tw = self._build_name(data.get("family_name_zh_tw"), data.get("given_name_zh_tw"))
-        name_en = self._build_name(data.get("family_name_en"), data.get("given_name_en"))
-        name_kr = self._build_name(data.get("family_name_kr"), data.get("given_name_kr"))
+        # 提取皮肤名称
+        # 'skin' 字段通常是中文的皮肤名，'skin_jp' 字段是日语皮肤名，作为后备
+        skin_cn_val = data.get("skin") or data.get("skin_cn")
+        skin_jp_val = data.get("skin_jp")
+        skin_tw_val = data.get("skin_zh_tw")
+
+        # 提取并构建基础名称
+        name = self._build_name(data.get("family_name"), data.get("given_name"))
+        base_name_cn = self._build_name(data.get("family_name_cn"), data.get("given_name_cn"))
+        base_name_jp = self._build_name(data.get("family_name_jp"), data.get("given_name_jp"))
+        base_name_tw = self._build_name(data.get("family_name_zh_tw"), data.get("given_name_zh_tw"))
+        base_name_en = self._build_name(data.get("family_name_en"), data.get("given_name_en"))
+        base_name_kr = self._build_name(data.get("family_name_kr"), data.get("given_name_kr"))
+
+        # 如果有皮肤名称，则附加到对应语言的名称后
+        name_cn = f"{base_name_cn} （{skin_cn_val}）" if base_name_cn and skin_cn_val else base_name_cn
+        name_jp = f"{base_name_jp} （{skin_jp_val}）" if base_name_jp and skin_jp_val else base_name_jp
+        name_tw = f"{base_name_tw} （{skin_tw_val}）" if base_name_tw and skin_tw_val else base_name_tw
+        name_en = base_name_en  # 英文和韩文名保持不变
+        name_kr = base_name_kr
 
         # 1. 处理 character_datas 中的常规形态
         file_id_from_voice = self._find_file_id_from_voice(data.get("voice", []))
@@ -178,14 +194,18 @@ class DataParser:
             if file_id in processed_file_ids:
                 continue
 
-            skin_name = data.get("skin_cn") or ""
+            skin_name = skin_cn_val or ""
 
             results.append(StudentForm(
                 file_id=file_id,
-                name_cn=name_cn, name_jp=name_jp, name_tw=name_tw,
-                name_en=name_en, name_kr=name_kr,
+                name=name,
                 skin_name=skin_name,
-                kivo_wiki_id=kivo_wiki_id
+                kivo_wiki_id=kivo_wiki_id,
+                name_cn=name_cn,
+                name_jp=name_jp,
+                name_tw=name_tw,
+                name_en=name_en,
+                name_kr=name_kr
             ))
             processed_file_ids.add(file_id)
 
@@ -195,10 +215,14 @@ class DataParser:
             if file_id not in processed_file_ids:
                 results.append(StudentForm(
                     file_id=file_id,
-                    name_cn=name_cn, name_jp=name_jp, name_tw=name_tw,
-                    name_en=name_en, name_kr=name_kr,
+                    name=name,
                     skin_name=skin_name,
-                    kivo_wiki_id=kivo_wiki_id
+                    kivo_wiki_id=kivo_wiki_id,
+                    name_cn=name_cn,
+                    name_jp=name_jp,
+                    name_tw=name_tw,
+                    name_en=name_en,
+                    name_kr=name_kr
                 ))
                 processed_file_ids.add(file_id)
 
