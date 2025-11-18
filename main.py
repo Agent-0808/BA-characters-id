@@ -14,7 +14,7 @@ STUDENT_ID_RANGE: Final[range] = range(1, 567)
 OUTPUT_FILENAME: Final[str] = "students_data.csv"
 SKIPPED_FILENAME: Final[str] = "skipped_ids.csv"
 MAX_CONCURRENT_REQUESTS: Final[int] = 5
-REQUEST_DELAY_SECONDS: Final[float] = 0.5
+REQUEST_DELAY_SECONDS: Final[float] = 2
 
 # 日志配置
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -47,6 +47,10 @@ class SkippedRecord:
     """用于存储跳过的ID及其原因的类"""
     student_id: int
     reason: str
+    name: str
+    name_jp: str
+    name_en: str
+    school: int | str
 
 
 # --- 3. API 请求模块 ---
@@ -81,17 +85,30 @@ class APIClient:
 class DataParser:
     """负责解析JSON数据并根据规则提取信息"""
 
-    def _is_valid_data(self, json_data: dict | None) -> bool:
-        """检查返回的JSON数据是否有效"""
+    def _validate_and_get_skip_reason(self, json_data: dict | None) -> str | None:
+        """
+        对JSON数据进行预检查，如果应跳过则返回原因，否则返回None。
+        """
         if not json_data or 'data' not in json_data:
-            return False
+            return "数据无效或缺少 'data' 键"
 
-        char_datas = json_data['data'].get('character_datas')
-        # 记录必须包含 character_datas 字段且其类型为列表。
-        # 原有的 dev_name 检查过于严格，会导致一些有效的 NPC 数据被跳过。
-        if not isinstance(char_datas, list):
-            return False
-        return True
+        data = json_data['data']
+        if not data:
+            return "键 'data' 的值为空"
+
+        # 规则1: 跳过特定学校ID（例如官方账号）
+        if data.get("school") == 30:
+            return "官方账号"
+
+        # 规则2: 跳过没有spine动画数据的记录
+        if not data.get("spine"):
+            return "缺少'spine'数据"
+
+        # 规则3: 检查 character_datas 字段是否存在且为列表
+        if not isinstance(data.get('character_datas'), list):
+            return "character_datas 格式无效"
+
+        return None
 
     def _build_name(self, family: str | None, given: str | None) -> str:
         """根据姓和名构建全名"""
@@ -112,16 +129,16 @@ class DataParser:
         # 移除 'J_' 前缀
         if file_id.startswith('J_'):
             file_id = file_id.removeprefix('J_')
-            
+
         # 移除 '_spr' 后缀
         if file_id.endswith('_spr'):
             file_id = file_id[:-4]  # 移除 "_spr"
-            
+
         # 检查是否以CH或NP开头，并且后面跟着4个数字
         if re.match(r"^(CH|NP)\d{4}$", file_id, re.IGNORECASE):
             return file_id.upper()
         return file_id.lower()
-    
+
     def _is_valid_file_id(self, file_id: str) -> bool:
         """
         检查file_id是否有效
@@ -130,13 +147,46 @@ class DataParser:
         """
         return len(file_id) > 2 and not file_id.isdigit()
 
+    def _extract_file_id_from_url(self, url: str | None) -> str | None:
+        """
+        从 URL 或字符串中提取标准的 file_id (CH/NPXXXX)。
+        """
+        if url and (match := FILE_ID_PATTERN.search(url)):
+            return self._normalize_file_id(match.group(0))
+        return None
+
+    def _find_file_id_from_avatar(self, data: dict) -> str | None:
+        """
+        从顶层 avatar 或 skin_list 中的 avatar 字段提取 file_id。
+        """
+        # 1. 检查顶层 avatar
+        if file_id := self._extract_file_id_from_url(data.get("avatar")):
+            return file_id
+
+        # 2. 检查 skin_list 中的 avatar
+        for skin in data.get("skin_list", []):
+            if file_id := self._extract_file_id_from_url(skin.get("avatar")):
+                return file_id  # 返回找到的第一个
+
+        return None
+
+    def _find_file_id_from_voice(self, voices: list[dict]) -> str | None:
+        """
+        最高优先级：从语音数据的 description 字段提取 file_id。
+        """
+        for voice in voices:
+            description = voice.get("description", "")
+            if file_id := self._extract_file_id_from_url(description):
+                return file_id
+        return None
+
     def _find_file_id_from_given_name_jp(self, given_name_jp: str | None) -> str | None:
         """
         从 given_name_jp 字段中提取 file_id。
         """
         if not given_name_jp:
             return None
-            
+
         # 直接使用_normalize_file_id处理，它会自动移除_spr后缀
         normalized_id = self._normalize_file_id(given_name_jp)
 
@@ -172,7 +222,7 @@ class DataParser:
         skin_name = title
         for key in CLEANUP_KEYWORDS:
             skin_name = skin_name.replace(key, "")
-        
+
         return skin_name.strip()
 
     def _find_special_forms_from_gallery(self, gallery: list[dict], base_skin_name: str = "") -> dict[str, str]:
@@ -188,9 +238,8 @@ class DataParser:
                 for image_url in gallery_item.get("images", []):
                     file_id_found: str | None = None
                     # 优先匹配标准 file_id 格式 (如 CH0123, NP0456)
-                    if match := FILE_ID_PATTERN.search(image_url):
-                        # 使用 group(0) 获取完整匹配，然后标准化格式
-                        file_id_found = self._normalize_file_id(match.group(0))
+                    if file_id := self._extract_file_id_from_url(image_url):
+                        file_id_found = file_id
                     # 若无标准ID，则尝试从文件名提取非标准ID (如 shiroko_robber)
                     else:
                         filename = image_url.split('/')[-1]
@@ -209,7 +258,7 @@ class DataParser:
                             combined_skin_name = base_skin_name
                         else:
                             combined_skin_name = gallery_skin_name
-                            
+
                         # 使用找到的第一个有效ID作为此形态的ID，然后处理下一个gallery item
                         special_forms[file_id_found] = combined_skin_name
                         break
@@ -220,8 +269,8 @@ class DataParser:
         解析单个JSON响应。
         返回 (StudentForm列表, None) 或 ([], 跳过原因)。
         """
-        if not self._is_valid_data(json_data):
-            return [], "数据无效或不符合要求"
+        if skip_reason := self._validate_and_get_skip_reason(json_data):
+            return [], skip_reason
 
         data = json_data['data']
         results: list[StudentForm] = []
@@ -250,8 +299,9 @@ class DataParser:
 
         # 1. 预先提取所有可能的 file_id 来源
         file_id_from_voice = self._find_file_id_from_voice(data.get("voice", []))
+        file_id_from_avatar = self._find_file_id_from_avatar(data)
         file_id_from_given_name_jp = None
-        
+
         if given_name_jp := data.get("given_name_jp"):
             # 仅当 given_name_jp 看起来像一个文件名时才处理
             if given_name_jp.endswith("_spr"):
@@ -261,23 +311,24 @@ class DataParser:
         for char_data in data.get("character_datas", []):
             file_id: str | None = None
             dev_name = char_data.get("dev_name")
-            if not dev_name:
-                continue
 
             # 优先级 1: 语音
             if file_id_from_voice:
                 file_id = file_id_from_voice
-            # 优先级 2: given_name_jp (处理_spr结尾的情况)
+            # 优先级 2: Avatar
+            elif file_id_from_avatar:
+                file_id = file_id_from_avatar
+            # 优先级 3: given_name_jp (处理_spr结尾的情况)
             elif file_id_from_given_name_jp:
                 file_id = file_id_from_given_name_jp
                 logging.debug(f"ID {kivo_wiki_id}: 从given_name_jp提取file_id: '{data.get('given_name_jp')}' -> '{file_id}'")
-            # 优先级 3: dev_name 作为后备
-            else:
+            # 优先级 4: dev_name 作为后备
+            elif dev_name:
                 file_id = self._normalize_file_id(dev_name.removesuffix("_default"))
-                logging.debug(f"ID {kivo_wiki_id}: 未能从语音或given_name_jp中找到 file_id, "
+                logging.debug(f"ID {kivo_wiki_id}: 未能从语音、avatar或given_name_jp中找到 file_id, "
                               f"回退'{dev_name}' -> '{file_id}'")
 
-            if file_id in processed_file_ids:
+            if not file_id or file_id in processed_file_ids:
                 continue
 
             skin_name = skin_cn_val or ""
@@ -295,10 +346,10 @@ class DataParser:
             ))
             processed_file_ids.add(file_id)
 
-        # 3. 后备方案：如果 character_datas 为空但我们有其他来源的 file_id
+        # 3. 后备方案：如果 character_datas 为空或未解析出结果
         if not results:
-            # 优先使用语音，其次是 given_name_jp
-            fallback_file_id = file_id_from_voice or file_id_from_given_name_jp
+            # 优先级: voice > avatar > given_name_jp
+            fallback_file_id = file_id_from_voice or file_id_from_avatar or file_id_from_given_name_jp
             if fallback_file_id and fallback_file_id not in processed_file_ids:
                 logging.debug(f"ID {kivo_wiki_id}: 使用后备 file_id '{fallback_file_id}'")
                 skin_name = skin_cn_val or ""
@@ -419,19 +470,48 @@ async def process_student_id(
     client: APIClient,
     parser: DataParser,
     semaphore: asyncio.Semaphore
-) -> tuple[int, list[StudentForm], str | None]:
+) -> tuple[int, list[StudentForm], SkippedRecord | None]:
     """
     获取、解析并处理单个学生ID的数据。
-    返回学生ID、处理结果的列表和可选的跳过原因。
+    返回学生ID、处理结果的列表和一个可选的SkippedRecord对象。
     """
     async with semaphore:
-        json_data, reason = await client.fetch_student_data(student_id)
-        await asyncio.sleep(REQUEST_DELAY_SECONDS)  # 请求延迟
+        json_data, fetch_reason = await client.fetch_student_data(student_id)
+        await asyncio.sleep(REQUEST_DELAY_SECONDS)
+
         if not json_data:
-            return student_id, [], reason
-        
-        forms, reason = parser.parse(json_data, student_id)
-        return student_id, forms, reason
+            # 在无法获取JSON数据时，创建一个包含基本信息的SkippedRecord
+            skipped = SkippedRecord(
+                student_id=student_id,
+                reason=fetch_reason or "未知网络原因",
+                name="",
+                name_jp="",
+                name_en="",
+                school=""
+            )
+            return student_id, [], skipped
+
+        forms, parse_reason = parser.parse(json_data, student_id)
+        if not forms:
+            # 如果解析失败或因规则被跳过，则从JSON数据中提取详细信息
+            data = json_data.get("data", {})
+            name = parser._build_name(data.get("family_name"), data.get("given_name")) or data.get("given_name_cn", "")
+            name_jp = parser._build_name(data.get("family_name_jp"), data.get("given_name_jp")) or ""
+            name_en = parser._build_name(data.get("family_name_en"), data.get("given_name_en")) or ""
+            school = data.get("school", "")
+
+            skipped = SkippedRecord(
+                student_id=student_id,
+                reason=parse_reason or "解析失败",
+                name=name,
+                name_jp=name_jp,
+                name_en=name_en,
+                school=school
+            )
+            return student_id, [], skipped
+
+        # 成功解析
+        return student_id, forms, None
 
 async def main():
     """主执行函数"""
@@ -455,20 +535,19 @@ async def main():
         processed_count = 0
         for future in asyncio.as_completed(tasks):
             processed_count += 1
-            student_id, forms_list, skip_reason = await future
+            student_id, forms_list, skipped_record = await future
 
             progress_prefix = f"[{processed_count}/{total_count}]"
 
-            if forms_list:
+            if skipped_record:
+                # 失败或跳过
+                print(f"{progress_prefix} ID: {student_id} -> 已跳过 ({skipped_record.reason})")
+                skipped_records.append(skipped_record)
+            else:
                 # 成功提取到数据
                 file_ids_str = ", ".join(form.file_id for form in forms_list)
                 print(f"{progress_prefix} ID: {student_id} -> 成功, File IDs: {file_ids_str}")
                 all_student_forms.extend(forms_list)
-            else:
-                # 失败或跳过，使用返回的具体原因
-                reason = skip_reason or "未知原因"
-                print(f"{progress_prefix} ID: {student_id} -> 已跳过 ({reason})")
-                skipped_records.append(SkippedRecord(student_id=student_id, reason=reason))
 
 
     # 按 file_id 排序以保证输出顺序稳定
@@ -480,7 +559,7 @@ async def main():
     # 写入文件
     writer = CsvWriter(OUTPUT_FILENAME)
     writer.write(all_student_forms)
-    
+
     # 写入跳过记录文件
     skipped_writer = CsvWriter(SKIPPED_FILENAME)
     skipped_writer.write_skipped(skipped_records)
