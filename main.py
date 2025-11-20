@@ -7,14 +7,21 @@ from dataclasses import dataclass, fields, astuple
 from typing import Final
 import httpx
 
+# TODO: 去除“立绘后缀"
+# TODO: 去除两个相同的skin_name
+
 # --- 1. 配置模块 ---
 
 # 可配置的常量
-API_BASE_URL: Final[str] = "https://api.kivo.wiki/api/v1/data/students/{student_id}"
+CHAR_API_BASE_URL: Final[str] = "https://api.kivo.wiki/api/v1/data/students/{student_id}"
 SPINE_API_BASE_URL: Final[str] = "https://api.kivo.wiki/api/v1/data/spines/{spine_id}"
-STUDENT_ID_RANGE: Final[range] = range(1, 20)
+
+FINAL_STUDENT_ID: Final[int] = 566
+STUDENT_ID_RANGE: Final[range] = range(1, FINAL_STUDENT_ID + 1)
+
 OUTPUT_FILENAME: Final[str] = "students_data.csv"
 SKIPPED_FILENAME: Final[str] = "skipped_ids.csv"
+
 MAX_CONCURRENT_REQUESTS: Final[int] = 3
 REQUEST_DELAY_SECONDS: Final[float] = 2
 
@@ -23,10 +30,6 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # 设置 httpx 日志级别为 WARNING，以屏蔽 INFO 级别的成功请求日志
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# 正则表达式预编译
-# 统一的 file_id 模式，匹配如 CH0201, np0001 等
-FILE_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"(?:CH|ch|NP|np)\d{4}")
-
 
 # --- 2. 数据结构定义 ---
 
@@ -34,8 +37,9 @@ FILE_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"(?:CH|ch|NP|np)\d{4}")
 class StudentForm:
     """用于存储单个角色形态结构化数据的类"""
     file_id: str
-    kivo_wiki_id: int
+    char_id: int
     spine_id: int | None
+    full_name: str
     name: str
     skin_name: str
     name_cn: str
@@ -74,7 +78,7 @@ class APIClient:
         根据学生ID获取数据。
         返回 (数据, None) 或 (None, 错误/跳过原因)。
         """
-        url = API_BASE_URL.format(student_id=student_id)
+        url = CHAR_API_BASE_URL.format(student_id=student_id)
         try:
             response = await self.client.get(url, timeout=10.0)
             if response.status_code == 404:
@@ -114,6 +118,18 @@ class APIClient:
 
 class DataParser:
     """负责解析JSON数据并根据规则提取信息"""
+
+    # 语言配置映射：(语言后缀, 是否包含皮肤名称)
+    # key: 目标字段后缀, value: (JSON中的姓key, JSON中的名key, JSON中的皮肤key, 是否附加皮肤)
+    _LANG_CONFIG: Final[dict[str, tuple[str, str, str, bool]]] = {
+        "full_name": ("family_name", "given_name", "skin", True), # 包含皮肤的完整名称
+        "name": ("family_name", "given_name", "", False), # 不包含皮肤的基础名称
+        "cn": ("family_name_cn", "given_name_cn", "skin_cn", True),
+        "jp": ("family_name_jp", "given_name_jp", "skin_jp", True),
+        "tw": ("family_name_zh_tw", "given_name_zh_tw", "skin_zh_tw", True),
+        "en": ("family_name_en", "given_name_en", "", False), # EN 不包含皮肤
+        "kr": ("family_name_kr", "given_name_kr", "", False), # KR 不包含皮肤
+    }
 
     def _get_spine_skip_reason(self, spine_item: dict[str, any]) -> str | None:
         """
@@ -182,114 +198,46 @@ class DataParser:
             return file_id.upper()
         return file_id.lower()
 
-    def _is_valid_file_id(self, file_id: str) -> bool:
+    def _build_formatted_name(
+        self, 
+        data: dict, 
+        lang_key: str, 
+        spine_remark: str
+    ) -> str:
         """
-        检查file_id是否有效
-        - 长度大于2
-        - 不是纯数字
+        通用方法：根据语言配置构建最终名称（姓名 + 皮肤后缀）
         """
-        return len(file_id) > 2 and not file_id.isdigit()
+        fam_key, giv_key, skin_key, include_skin = self._LANG_CONFIG[lang_key]
+        
+        # 1. 构建基础姓名
+        base_name = self._build_name(data.get(fam_key), data.get(giv_key))
+        
+        # 如果连名字都没有（比如CN名字为空），直接返回空字符串
+        if not base_name:
+            return ""
 
-    def _extract_file_id_from_url(self, url: str | None) -> str | None:
-        """
-        从 URL 或字符串中提取标准的 file_id (CH/NPXXXX)。
-        """
-        if url and (match := FILE_ID_PATTERN.search(url)):
-            return self._normalize_file_id(match.group(0))
-        return None
+        # 2. 如果该语言不需要皮肤（如EN/KR），直接返回姓名
+        if not include_skin:
+            return base_name
 
-    def _find_file_id_from_avatar(self, data: dict) -> str | None:
-        """
-        从 avatar 字段提取 file_id。
-        """
-        if file_id := self._extract_file_id_from_url(data.get("avatar")):
-            return file_id
+        # 3. 处理皮肤名称
+        base_skin = data.get(skin_key) or ""
+        
+        # 逻辑：如果有 base_skin，则用 base_skin。
+        # 如果有 spine_remark 且不是"初始立绘" 且 不等于 base_skin，则追加
+        # 解决 TODO: 去除两个相同的skin_name
+        skin_parts = []
+        if base_skin:
+            skin_parts.append(base_skin)
+        
+        if spine_remark and spine_remark != "初始立绘" and spine_remark != base_skin:
+            skin_parts.append(spine_remark)
+        
+        final_skin = ",".join(skin_parts)
 
-        return None
-
-    def _find_file_id_from_given_name_jp(self, given_name_jp: str | None) -> str | None:
-        """
-        从 given_name_jp 字段中提取 file_id。
-        """
-        if not given_name_jp:
-            return None
-
-        # 直接使用_normalize_file_id处理，它会自动移除_spr后缀
-        normalized_id = self._normalize_file_id(given_name_jp)
-
-        return normalized_id
-
-    def _find_file_id_from_voice(self, voices: list[dict]) -> str | None:
-        """
-        最高优先级：从语音数据的 description 字段提取 file_id。
-        """
-        for voice in voices:
-            description = voice.get("description", "")
-            if match := FILE_ID_PATTERN.search(description):
-                # 使用 group(0) 获取完整匹配，然后标准化格式
-                return self._normalize_file_id(match.group(0))
-        return None
-
-    def _parse_skin_name_from_title(self, title: str) -> str | None:
-        """
-        从 gallery 的 title 中解析出皮肤名。
-        如果 title 代表一个特殊形态，则返回处理后的 skin_name (可能为空字符串)；
-        否则返回 None。
-        """
-        # 定义标识特殊形态的核心关键字
-        IDENTIFY_KEYWORDS: Final[tuple[str, ...]] = ("立绘", "差分")
-        # 定义需要从标题中移除的关键字，按长度降序排列以避免错误替换
-        CLEANUP_KEYWORDS: Final[tuple[str, ...]] = ("初始", "差分", "立绘", "脸部", "表情", "脸图", "-")
-
-        # 检查标题是否包含任何一个核心关键字
-        if not any(key in title for key in IDENTIFY_KEYWORDS):
-            return None
-
-        # 移除所有关键字以提取皮肤名
-        skin_name = title
-        for key in CLEANUP_KEYWORDS:
-            skin_name = skin_name.replace(key, "")
-
-        return skin_name.strip()
-
-    def _find_special_forms_from_gallery(self, gallery: list[dict], base_skin_name: str = "") -> dict[str, str]:
-        """
-        次高优先级：从图库中提取特殊形态的 file_id 及其形态名称。
-        主要针对 "领航服差分" 等未在 character_datas 中定义的形态。
-        """
-        special_forms = {}
-        for gallery_item in gallery:
-            title = gallery_item.get("title", "")
-            # 使用辅助函数来判断和提取 skin_name
-            if (gallery_skin_name := self._parse_skin_name_from_title(title)) is not None:
-                for image_url in gallery_item.get("images", []):
-                    file_id_found: str | None = None
-                    # 优先匹配标准 file_id 格式 (如 CH0123, NP0456)
-                    if file_id := self._extract_file_id_from_url(image_url):
-                        file_id_found = file_id
-                    # 若无标准ID，则尝试从文件名提取非标准ID (如 shiroko_robber)
-                    else:
-                        filename = image_url.split('/')[-1]
-                        # 假定ID是文件名中 "_spr_" 之前的部分
-                        if '_spr_' in filename:
-                            potential_id = filename.split('_spr_', 1)[0]
-                            # 验证提取的ID是否有效
-                            if self._is_valid_file_id(potential_id):
-                                file_id_found = self._normalize_file_id(potential_id)
-
-                    if file_id_found:
-                        # 结合基础皮肤名和图库皮肤名
-                        if base_skin_name and gallery_skin_name:
-                            combined_skin_name = f"{base_skin_name},{gallery_skin_name}"
-                        elif base_skin_name:
-                            combined_skin_name = base_skin_name
-                        else:
-                            combined_skin_name = gallery_skin_name
-
-                        # 使用找到的第一个有效ID作为此形态的ID，然后处理下一个gallery item
-                        special_forms[file_id_found] = combined_skin_name
-                        break
-        return special_forms
+        if final_skin:
+            return f"{base_name}（{final_skin}）"
+        return base_name
 
     def parse(self, json_data: dict, kivo_wiki_id: int, spine_data: list[dict[str, any]]) -> tuple[
         list[StudentForm], list[SkippedRecord], str | None]:
@@ -305,170 +253,75 @@ class DataParser:
         skipped_spines: list[SkippedRecord] = []
         processed_file_ids: set[str] = set()
 
-        # 提取基础信息
-        name = self._build_name(data.get("family_name"), data.get("given_name"))
-        base_name_cn = self._build_name(data.get("family_name_cn"), data.get("given_name_cn"))
+        # 预先获取用于 SkippedRecord 的基础信息 (使用 default/jp 逻辑)
         base_name_jp = self._build_name(data.get("family_name_jp"), data.get("given_name_jp"))
-        base_name_tw = self._build_name(data.get("family_name_zh_tw"), data.get("given_name_zh_tw"))
         base_name_en = self._build_name(data.get("family_name_en"), data.get("given_name_en"))
-        base_name_kr = self._build_name(data.get("family_name_kr"), data.get("given_name_kr"))
+        # 默认 name 用于记录
+        default_name = self._build_name(data.get("family_name"), data.get("given_name"))
 
-        # 从学生主数据中提取各语言的基础皮肤名
-        base_skin_cn = data.get("skin") or data.get("skin_cn") or ""
-        base_skin_jp = data.get("skin_jp") or ""
-        base_skin_tw = data.get("skin_zh_tw") or ""
-
-        # 1. 最高优先级：从 spine 数据提取
+        # 从 spine 数据提取 file_id
         for spine_item in spine_data:
             if skip_reason := self._get_spine_skip_reason(spine_item):
-                # 从 spine_item 中获取 spine_id, name 和 remark
-                spine_id = spine_item.get("id")
-                spine_name = spine_item.get("name")
-                spine_remark = spine_item.get("remark", "")
-                
                 skipped_spines.append(SkippedRecord(
                     student_id=kivo_wiki_id,
-                    spine_id=spine_id,
+                    spine_id=spine_item.get("id"),
                     reason=skip_reason,
-                    spine_name=spine_name,
-                    spine_remark=spine_remark,
-                    name=name, 
+                    spine_name=spine_item.get("name"),
+                    spine_remark=spine_item.get("remark", ""),
+                    name=default_name, 
                     name_jp=base_name_jp, 
                     name_en=base_name_en, 
                     school=data.get("school", "")
                 ))
                 continue
 
-            # 经过滤，我们确信 spine_name_raw 存在
             spine_name_raw = spine_item["name"]
             file_id = self._normalize_file_id(spine_name_raw)
+            
             if not file_id or file_id in processed_file_ids:
                 continue
 
-            # 从 spine_item 中获取 spine_id 和 remark
+            # 获取 Spine 备注
             spine_id = spine_item.get("id")
             spine_remark = spine_item.get("remark", "")
 
-            # 根据 remark 和基础皮肤名确定最终皮肤名
-            final_skin_cn = base_skin_cn
-            final_skin_jp = base_skin_jp
-            final_skin_tw = base_skin_tw
+            # --- 构建各语言名称 ---
+            # 使用字典推导式一次性生成所有需要的名称字段
+            # map key (e.g., 'cn') -> formatted name string
+            names = {
+                key: self._build_formatted_name(data, key, spine_remark)
+                for key in self._LANG_CONFIG
+            }
 
-            # 如果 remark 不是 "初始立绘"，则将其作为附加皮肤名
-            if spine_remark and spine_remark != "初始立绘":
-                # 如果已有基础皮肤名，则用逗号连接
-                final_skin_cn = f"{base_skin_cn},{spine_remark}" if base_skin_cn else spine_remark
-                # 对于日文和繁中，如果主数据中没有，则也使用 remark
-                final_skin_jp = f"{base_skin_jp},{spine_remark}" if base_skin_jp else spine_remark
-                final_skin_tw = f"{base_skin_tw},{spine_remark}" if base_skin_tw else spine_remark
-
-            # 根据最终皮肤名构建多语言名称
-            name_cn = f"{base_name_cn} （{final_skin_cn}）" if base_name_cn and final_skin_cn else base_name_cn
-            name_jp = f"{base_name_jp} （{final_skin_jp}）" if base_name_jp and final_skin_jp else base_name_jp
-            name_tw = f"{base_name_tw} （{final_skin_tw}）" if base_name_tw and final_skin_tw else base_name_tw
+            # 计算 skin_name (仅用于 skin_name 字段，逻辑同 default 但只取括号内部分)
+            # 这里复用一下逻辑，手动构建
+            base_skin = data.get("skin") or ""
+            skin_parts = []
+            if base_skin:
+                skin_parts.append(base_skin)
+            if spine_remark and spine_remark != "初始立绘" and spine_remark != base_skin:
+                skin_parts.append(spine_remark)
+            final_skin_str = ",".join(skin_parts) if skin_parts else (spine_remark if spine_remark != "初始立绘" else "")
 
             results.append(StudentForm(
                 file_id=file_id,
-                kivo_wiki_id=kivo_wiki_id,
+                char_id=kivo_wiki_id,
                 spine_id=spine_id,
-                name=name,
-                skin_name=final_skin_cn,
-                name_cn=name_cn,
-                name_jp=name_jp,
-                name_tw=name_tw,
-                name_en=base_name_en,
-                name_kr=base_name_kr
+                full_name=names["full_name"],
+                name=names["name"],
+                skin_name=final_skin_str,
+                name_cn=names["cn"],
+                name_jp=names["jp"],
+                name_tw=names["tw"],
+                name_en=names["en"],
+                name_kr=names["kr"]
             ))
             processed_file_ids.add(file_id)
 
-
-        # --- 2. 后备逻辑 ---
-        # 为后备方案统一构建名称
-        fallback_name_cn = f"{base_name_cn} （{base_skin_cn}）" if base_name_cn and base_skin_cn else base_name_cn
-        fallback_name_jp = f"{base_name_jp} （{base_skin_jp}）" if base_name_jp and base_skin_jp else base_name_jp
-        fallback_name_tw = f"{base_name_tw} （{base_skin_tw}）" if base_name_tw and base_skin_tw else base_name_tw
-
-        # 2a. 预先提取所有可能的 file_id 来源
-        file_id_from_voice = self._find_file_id_from_voice(data.get("voice", []))
-        file_id_from_avatar = self._find_file_id_from_avatar(data)
-        file_id_from_given_name_jp = None
-
-        if given_name_jp := data.get("given_name_jp"):
-            # 仅当 given_name_jp 看起来像一个文件名时才处理
-            if given_name_jp.endswith("_spr"):
-                file_id_from_given_name_jp = self._find_file_id_from_given_name_jp(given_name_jp)
-
-        # 2b. 处理 character_datas 中的常规形态
-        for char_data in data.get("character_datas", []):
-            file_id: str | None = None
-            dev_name = char_data.get("dev_name")
-
-            # 优先级 1: 语音
-            if file_id_from_voice:
-                file_id = file_id_from_voice
-            # 优先级 2: Avatar
-            elif file_id_from_avatar:
-                file_id = file_id_from_avatar
-            # 优先级 3: given_name_jp (处理_spr结尾的情况)
-            elif file_id_from_given_name_jp:
-                file_id = file_id_from_given_name_jp
-                logging.debug(f"ID {kivo_wiki_id}: 从given_name_jp提取file_id: '{data.get('given_name_jp')}' -> '{file_id}'")
-            # 优先级 4: dev_name 作为后备
-            elif dev_name:
-                file_id = self._normalize_file_id(dev_name.removesuffix("_default"))
-                logging.debug(f"ID {kivo_wiki_id}: 未能从语音、avatar或given_name_jp中找到 file_id, "
-                              f"回退'{dev_name}' -> '{file_id}'")
-
-            if not file_id or file_id in processed_file_ids:
-                continue
-
-            results.append(StudentForm(
-                file_id=file_id, kivo_wiki_id=kivo_wiki_id, spine_id=None, name=name,
-                skin_name=base_skin_cn, name_cn=fallback_name_cn, name_jp=fallback_name_jp,
-                name_tw=fallback_name_tw, name_en=base_name_en, name_kr=base_name_kr
-            ))
-            processed_file_ids.add(file_id)
-
-        # 2c. 后备方案：如果 character_datas 为空或未解析出结果
-        if not processed_file_ids:
-            fallback_file_id = file_id_from_voice or file_id_from_avatar or file_id_from_given_name_jp
-            if fallback_file_id and fallback_file_id not in processed_file_ids:
-                logging.debug(f"ID {kivo_wiki_id}: 使用后备 file_id '{fallback_file_id}'")
-                results.append(StudentForm(
-                    file_id=fallback_file_id, kivo_wiki_id=kivo_wiki_id, spine_id=None, name=name,
-                    skin_name=base_skin_cn, name_cn=fallback_name_cn, name_jp=fallback_name_jp,
-                    name_tw=fallback_name_tw, name_en=base_name_en, name_kr=base_name_kr
-                ))
-                processed_file_ids.add(fallback_file_id)
-
-        # 2d. 处理 gallery 中的特殊形态
-        special_forms = self._find_special_forms_from_gallery(data.get("gallery", []), base_skin_cn)
-        for file_id, skin_name in special_forms.items():
-            if file_id not in processed_file_ids:
-                # gallery 的 skin_name 是新解析的，需重新构建名称
-                name_cn = f"{base_name_cn} （{skin_name}）" if base_name_cn and skin_name else base_name_cn
-                name_jp = f"{base_name_jp} （{skin_name}）" if base_name_jp and skin_name else base_name_jp
-                name_tw = f"{base_name_tw} （{skin_name}）" if base_name_tw and skin_name else base_name_tw
-                results.append(StudentForm(
-                    file_id=file_id,
-                    kivo_wiki_id=kivo_wiki_id,
-                    spine_id=None,
-                    name=name,
-                    skin_name=skin_name,
-                    name_cn=name_cn,
-                    name_jp=name_jp,
-                    name_tw=name_tw,
-                    name_en=base_name_en,
-                    name_kr=base_name_kr
-                ))
-                processed_file_ids.add(file_id)
-
-        # 在函数末尾增加检查：如果最终没有解析到任何数据，则返回具体原因
         if not results and not skipped_spines:
             return [], [], "未找到可解析的角色形态"
 
         return results, skipped_spines, None
-
 # --- 5. 文件输出模块 ---
 
 class CsvWriter:
@@ -652,7 +505,7 @@ async def main():
 
 
     # 按 file_id 排序以保证输出顺序稳定
-    all_student_forms.sort(key=lambda x: (x.kivo_wiki_id, x.file_id))
+    all_student_forms.sort(key=lambda x: (x.char_id, x.file_id))
 
     # 按 student_id 和 spine_id 排序以保证输出顺序稳定
     skipped_records.sort(key=lambda x: (x.student_id, x.spine_id or -1))
