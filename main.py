@@ -198,6 +198,27 @@ class DataParser:
             return file_id.upper()
         return file_id.lower()
 
+    def _process_spine_remark(self, remark: str | None, base_skin: str | None) -> str:
+        """
+        处理 Spine 备注信息
+        """
+        if not remark:
+            return ""
+
+        # "初始立绘" 直接忽略
+        if remark == "初始立绘": return ""
+
+        # 去除后缀
+        suffixes = ["立绘", "差分"]
+        for suffix in suffixes:
+            processed = remark.removesuffix(suffix)
+
+        # 如果处理后的备注与该角色的基础皮肤名一致，则不重复添加
+        if base_skin and processed == base_skin:
+            return ""
+
+        return processed
+
     def _build_formatted_name(
         self, 
         data: dict, 
@@ -223,15 +244,15 @@ class DataParser:
         # 3. 处理皮肤名称
         base_skin = data.get(skin_key) or ""
         
-        # 逻辑：如果有 base_skin，则用 base_skin。
-        # 如果有 spine_remark 且不是"初始立绘" 且 不等于 base_skin，则追加
-        # 解决 TODO: 去除两个相同的skin_name
+        # 调用统一的处理函数处理 spine_remark
+        processed_remark = self._process_spine_remark(spine_remark, base_skin)
+        
         skin_parts = []
         if base_skin:
             skin_parts.append(base_skin)
         
-        if spine_remark and spine_remark != "初始立绘" and spine_remark != base_skin:
-            skin_parts.append(spine_remark)
+        if processed_remark:
+            skin_parts.append(processed_remark)
         
         final_skin = ",".join(skin_parts)
 
@@ -296,12 +317,16 @@ class DataParser:
             # 计算 skin_name (仅用于 skin_name 字段，逻辑同 default 但只取括号内部分)
             # 这里复用一下逻辑，手动构建
             base_skin = data.get("skin") or ""
+            # 调用统一的处理函数处理 spine_remark
+            processed_remark = self._process_spine_remark(spine_remark, base_skin)
+
             skin_parts = []
             if base_skin:
                 skin_parts.append(base_skin)
-            if spine_remark and spine_remark != "初始立绘" and spine_remark != base_skin:
-                skin_parts.append(spine_remark)
-            final_skin_str = ",".join(skin_parts) if skin_parts else (spine_remark if spine_remark != "初始立绘" else "")
+            if processed_remark:
+                skin_parts.append(processed_remark)
+                
+            final_skin_str = ",".join(skin_parts)
 
             results.append(StudentForm(
                 file_id=file_id,
@@ -322,6 +347,7 @@ class DataParser:
             return [], [], "未找到可解析的角色形态"
 
         return results, skipped_spines, None
+
 # --- 5. 文件输出模块 ---
 
 class CsvWriter:
