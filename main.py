@@ -1,16 +1,17 @@
-# main.py
 import asyncio
 import csv
 import logging
 import re
+import json
+from pathlib import Path
 from dataclasses import dataclass, fields, astuple
-from typing import Final
+from typing import Final, Any
 import httpx
 
 # TODO: 去除“立绘后缀"
 # TODO: 去除两个相同的skin_name
 
-# --- 1. 配置模块 ---
+# --- 配置模块 ---
 
 # 可配置的常量
 CHAR_API_BASE_URL: Final[str] = "https://api.kivo.wiki/api/v1/data/students/{student_id}"
@@ -21,6 +22,7 @@ STUDENT_ID_RANGE: Final[range] = range(1, FINAL_STUDENT_ID + 1)
 
 OUTPUT_FILENAME: Final[str] = "students_data.csv"
 SKIPPED_FILENAME: Final[str] = "skipped_ids.csv"
+CACHE_DIR: Final[Path] = Path("cache")
 
 MAX_CONCURRENT_REQUESTS: Final[int] = 3
 REQUEST_DELAY_SECONDS: Final[float] = 2
@@ -31,7 +33,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
-# --- 2. 数据结构定义 ---
+# --- 数据结构定义 ---
 
 @dataclass
 class StudentForm:
@@ -62,45 +64,167 @@ class SkippedRecord:
     name_en: str = ""
     school: int | str = ""
 
+class CacheManager:
+    """负责本地数据的缓存管理"""
+
+    def __init__(self, base_dir: Path = CACHE_DIR):
+        self.base_dir = base_dir
+        self.students_dir = base_dir / "students"
+        self.spines_dir = base_dir / "spines"
+        self._ensure_dirs()
+
+    def _ensure_dirs(self):
+        """确保缓存目录存在"""
+        self.students_dir.mkdir(parents=True, exist_ok=True)
+        self.spines_dir.mkdir(parents=True, exist_ok=True)
+
+    def _clean_student_data(self, json_data: dict[str, Any]) -> dict[str, Any]:
+        """
+        清洗学生数据，移除不需要的大文本字段以节省空间
+        """
+        if not json_data or 'data' not in json_data:
+            return json_data
+
+        data = json_data['data']
+        if not isinstance(data, dict):
+            return json_data
+
+        # 1. 移除明确不需要的字段
+        for field in ['more', 'gallery']:
+            data.pop(field, None)
+
+        # 2. 处理 Voice 字段，仅保留“是否为空列表”的信息
+        # 逻辑：如果有内容，替换为占位符表示存在；如果为空或不存在，保持为空列表
+        voice_fields = ['voice', 'voice_cn', 'voice_kr']
+        for field in voice_fields:
+            if field in data:
+                content = data[field]
+                if isinstance(content, list) and content:
+                    # 如果列表不为空，替换为简短标记，保留"非空"这一信息
+                    data[field] = ["(cached_stripped)"]
+                else:
+                    # 否则设置为空列表
+                    data[field] = []
+
+        return json_data
+
+    async def get_student(self, student_id: int) -> dict | None:
+        """从缓存读取学生数据"""
+        file_path = self.students_dir / f"{student_id}.json"
+        return await self._read_json(file_path)
+
+    async def save_student(self, student_id: int, data: dict):
+        """清洗并保存学生数据到缓存"""
+        cleaned_data = self._clean_student_data(data)
+        file_path = self.students_dir / f"{student_id}.json"
+        await self._write_json(file_path, cleaned_data)
+
+    async def get_spine(self, spine_id: int) -> dict | None:
+        """从缓存读取 Spine 数据"""
+        file_path = self.spines_dir / f"{spine_id}.json"
+        return await self._read_json(file_path)
+
+    async def save_spine(self, spine_id: int, data: dict):
+        """保存 Spine 数据到缓存 (Spine 数据通常较小，不做额外清洗)"""
+        file_path = self.spines_dir / f"{spine_id}.json"
+        await self._write_json(file_path, data)
+
+    async def _read_json(self, path: Path) -> dict | None:
+        """异步读取 JSON 文件"""
+        if not path.exists():
+            return None
+        try:
+            # 使用 asyncio.to_thread 避免文件IO阻塞事件循环
+            return await asyncio.to_thread(self._read_json_sync, path)
+        except Exception as e:
+            logging.warning(f"读取缓存失败 {path}: {e}")
+            return None
+
+    def _read_json_sync(self, path: Path) -> dict:
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+
+    async def _write_json(self, path: Path, data: dict):
+        """异步写入紧凑格式 JSON"""
+        try:
+            await asyncio.to_thread(self._write_json_sync, path, data)
+        except Exception as e:
+            logging.error(f"写入缓存失败 {path}: {e}")
+
+    def _write_json_sync(self, path: Path, data: dict):
+        with open(path, 'w', encoding='utf-8') as f:
+            # 使用 separators 生成紧凑的 JSON (无多余空格)
+            json.dump(data, f, ensure_ascii=False, separators=(',', ':'))
 
 class APIClient:
-    """负责处理所有网络请求的客户端"""
+    """负责处理所有网络请求及缓存管理的客户端"""
 
-    def __init__(self, client: httpx.AsyncClient):
+    def __init__(self, client: httpx.AsyncClient, cache_manager: CacheManager):
         self.client = client
+        self.cache = cache_manager
 
         self.client.headers.update({
             "User-Agent": "BA-characters-internal-id (https://github.com/Agent-0808/BA-characters-internal-id)"
         })
 
-    async def fetch_student_data(self, student_id: int) -> tuple[dict | None, str | None]:
+    async def fetch_student_data(self, student_id: int) -> tuple[dict | None, str | None, bool]:
         """
-        根据学生ID获取数据。
-        返回 (数据, None) 或 (None, 错误/跳过原因)。
+        根据学生ID获取数据（优先查缓存）。
+        返回 (数据, 错误/跳过原因, 是否命中缓存)。
         """
+        # 1. 尝试从缓存获取
+        if cached_data := await self.cache.get_student(student_id):
+            logging.debug(f"ID {student_id}: 命中缓存")
+            # 返回 True 表示命中缓存
+            return cached_data, None, True
+
+        # 2. 缓存未命中，从 API 获取
         url = CHAR_API_BASE_URL.format(student_id=student_id)
         try:
             response = await self.client.get(url, timeout=10.0)
             if response.status_code == 404:
-                return None, "未找到 (404)"
+                # 未找到，未命中缓存
+                return None, "未找到 (404)", False
             response.raise_for_status()
-            return response.json(), None
+            
+            json_data = response.json()
+            
+            # 3. 成功获取后，保存到缓存
+            if json_data and json_data.get('code') == 2000:
+                await self.cache.save_student(student_id, json_data)
+            
+            # 返回 False 表示来自 API 请求
+            return json_data, None, False
+
         except httpx.RequestError as e:
-            return None, f"网络错误: {e}"
+            return None, f"网络错误: {e}", False
         except Exception as e:
             logging.error(f"处理 ID {student_id} 时发生未知错误: {e}")
-            return None, f"未知错误: {e}"
+            return None, f"未知错误: {e}", False
 
-    async def fetch_spine_data(self, spine_id: int) -> tuple[dict[str, any] | None, str | None]:
-        """根据 spine_id 获取 spine 数据。返回 (数据, None) 或 (None, 错误原因)"""
+    async def fetch_spine_data(self, spine_id: int) -> tuple[dict[str, Any] | None, str | None]:
+        """
+        根据 spine_id 获取 spine 数据（优先查缓存）。
+        注意：此函数暂不需要返回是否命中缓存，因为并发获取时不由它控制主延迟。
+        """
+        # 1. 尝试从缓存获取
+        if cached_data := await self.cache.get_spine(spine_id):
+            if isinstance(cached_data, dict) and 'data' in cached_data:
+                return cached_data['data'], None
+            return cached_data, None 
+
+        # 2. 缓存未命中，从 API 获取
         url = SPINE_API_BASE_URL.format(spine_id=spine_id)
         try:
             response = await self.client.get(url, timeout=10.0)
             response.raise_for_status()
             json_response = response.json()
-            # 确保返回的数据是有效的字典且包含 'data' 键
+            
             if isinstance(json_response, dict) and 'data' in json_response:
+                # 3. 成功获取后，保存完整响应到缓存
+                await self.cache.save_spine(spine_id, json_response)
                 return json_response['data'], None
+                
             logging.warning(f"Spine ID {spine_id} 的响应格式无效: {json_response}")
             return None, "响应格式无效"
         except httpx.HTTPStatusError as e:
@@ -114,7 +238,7 @@ class APIClient:
             logging.error(f"处理 Spine ID {spine_id} 时发生未知错误: {e}")
             return None, f"未知错误: {e}"
 
-# --- 4. 数据解析模块 ---
+# --- 数据解析模块 ---
 
 class DataParser:
     """负责解析JSON数据并根据规则提取信息"""
@@ -163,9 +287,13 @@ class DataParser:
         if not data:
             return "键 'data' 的值为空"
 
-        # 规则1: 跳过特定学校ID（例如官方账号）
+        # 跳过特定学校ID（例如官方账号）
         if data.get("school") == 30:
             return "官方账号"
+
+        # 遁
+        if data.get("id") == 348:
+            return "彩蛋"
 
         return None
 
@@ -348,7 +476,7 @@ class DataParser:
 
         return results, skipped_spines, None
 
-# --- 5. 文件输出模块 ---
+# --- 文件输出模块 ---
 
 class CsvWriter:
     """负责将处理好的数据写入CSV文件"""
@@ -422,7 +550,7 @@ class CsvWriter:
                     continue
 
 
-# --- 6. 主逻辑与执行 ---
+# --- 主逻辑与执行 ---
 
 async def process_student_id(
     student_id: int,
@@ -432,13 +560,16 @@ async def process_student_id(
 ) -> tuple[int, list[StudentForm], list[SkippedRecord]]:
     """
     获取、解析并处理单个学生ID的数据。
-    返回学生ID、处理结果的列表和一个SkippedRecord列表。
     """
     async with semaphore:
         all_skipped: list[SkippedRecord] = []
-        json_data, fetch_reason = await client.fetch_student_data(student_id)
-        # 即使请求学生数据失败，也需要延迟，避免对API造成过大压力
-        await asyncio.sleep(REQUEST_DELAY_SECONDS)
+        
+        # 获取数据，并得知来源是否为缓存
+        json_data, fetch_reason, from_cache = await client.fetch_student_data(student_id)
+        
+        # 如果数据不是来自缓存（即发起了网络请求），则执行延迟以礼貌对待 API
+        if not from_cache:
+            await asyncio.sleep(REQUEST_DELAY_SECONDS)
 
         if not json_data:
             # 在无法获取JSON数据时，创建一个包含基本信息的SkippedRecord
@@ -492,11 +623,14 @@ async def main():
     """主执行函数"""
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     parser = DataParser()
+    cache_manager = CacheManager()
+    
     all_student_forms: list[StudentForm] = []
     skipped_records: list[SkippedRecord] = []
 
     async with httpx.AsyncClient() as http_client:
-        client = APIClient(http_client)
+        # 将 cache_manager 注入 APIClient
+        client = APIClient(http_client, cache_manager)
         student_ids = list(STUDENT_ID_RANGE)
         total_count = len(student_ids)
 
@@ -505,7 +639,7 @@ async def main():
             for student_id in student_ids
         ]
 
-        logging.info(f"开始处理 {total_count} 个学生 ID...")
+        logging.info(f"开始处理 {total_count} 个学生 ID (使用缓存路径: {CACHE_DIR})...")
 
         processed_count = 0
         for future in asyncio.as_completed(tasks):
