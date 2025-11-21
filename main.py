@@ -162,6 +162,10 @@ class APIClient:
     def __init__(self, client: httpx.AsyncClient, cache_manager: CacheManager):
         self.client = client
         self.cache = cache_manager
+        
+        # 统计 API 请求次数
+        self.student_req_count: int = 0
+        self.spine_req_count: int = 0
 
         self.client.headers.update({
             "User-Agent": "BA-characters-internal-id (https://github.com/Agent-0808/BA-characters-internal-id)"
@@ -179,6 +183,9 @@ class APIClient:
             return cached_data, None, True
 
         # 2. 缓存未命中，从 API 获取
+        # 记录请求计数
+        self.student_req_count += 1
+        
         url = CHAR_API_BASE_URL.format(student_id=student_id)
         try:
             response = await self.client.get(url, timeout=10.0)
@@ -214,6 +221,9 @@ class APIClient:
             return cached_data, None 
 
         # 2. 缓存未命中，从 API 获取
+        # 记录请求计数
+        self.spine_req_count += 1
+
         url = SPINE_API_BASE_URL.format(spine_id=spine_id)
         try:
             response = await self.client.get(url, timeout=10.0)
@@ -255,24 +265,36 @@ class DataParser:
         "kr": ("family_name_kr", "given_name_kr", "", False), # KR 不包含皮肤
     }
 
-    def _get_spine_skip_reason(self, spine_item: dict[str, any]) -> str | None:
+    def _get_spine_skip_reason(self, spine_item: dict[str, Any]) -> str | None:
         """
         检查单个 spine 数据，如果应跳过则返回原因，否则返回 None。
         """
-        if not spine_item or not spine_item.get("name"):
+        if not spine_item or not (name := spine_item.get("name")):
             return "缺少名称或数据无效"
 
+        # 统一转换为小写以进行不区分大小写的比较
+        name_lower = name.lower()
+
         # 只接受spr类型
-        if type := spine_item.get("type"):
-            if type != "spr":
-                return f"类型 ({type})"
+        ACCEPT_TYPES = ["spr"]
+        if (type_ := spine_item.get("type")) not in ACCEPT_TYPES:
+            return f"类型 ({type_})"
+        
+        # 跳过包含特定关键词的形态
+        SPINE_KEYWORDS_TO_SKIP: Final[list[str]] = [
+            "toschool"
+        ]
+        for keyword in SPINE_KEYWORDS_TO_SKIP:
+            if keyword in name_lower:
+                return f"包含 ({keyword})"
 
         # 跳过特定后缀的形态
-        SPINE_SUFFIXES_TO_SKIP: Final[list[str]] = ["_cn", "_steam", "_glitch_spr", "_cbt"]
-
+        SPINE_SUFFIXES_TO_SKIP: Final[list[str]] = [
+            "_cn", "_steam", "_glitch_spr", "_cbt", "_old", "_update", "_halofix"
+        ]
         for suffix in SPINE_SUFFIXES_TO_SKIP:
-            if spine_item.get("name").lower().endswith(suffix.lower()):
-                return f"后缀 ({suffix})"
+            if name_lower.endswith(suffix):
+                return f"后缀 ({suffix.removeprefix('_')})"
 
         return None
 
@@ -334,12 +356,13 @@ class DataParser:
             return ""
 
         # "初始立绘" 直接忽略
-        if remark == "初始立绘": return ""
+        if "初始立绘" in remark: return ""
 
         # 去除后缀
+        processed = remark
         suffixes = ["立绘", "差分"]
         for suffix in suffixes:
-            processed = remark.removesuffix(suffix)
+            processed = processed.removesuffix(suffix)
 
         # 如果处理后的备注与该角色的基础皮肤名一致，则不重复添加
         if base_skin and processed == base_skin:
@@ -388,7 +411,7 @@ class DataParser:
             return f"{base_name}（{final_skin}）"
         return base_name
 
-    def parse(self, json_data: dict, kivo_wiki_id: int, spine_data: list[dict[str, any]]) -> tuple[
+    def parse(self, json_data: dict, kivo_wiki_id: int, spine_data: list[dict[str, Any]]) -> tuple[
         list[StudentForm], list[SkippedRecord], str | None]:
         """
         解析单个JSON响应。
@@ -651,17 +674,22 @@ async def main():
             if forms_list:
                 # 成功提取到数据
                 file_ids_str = ", ".join(form.file_id for form in forms_list)
-                print(f"{progress_prefix} ID: {student_id} -> 成功, File IDs: {file_ids_str}")
+                logging.info(f"{progress_prefix} ID: {student_id} -> 成功, File IDs: {file_ids_str}")
                 all_student_forms.extend(forms_list)
 
             if newly_skipped_records:
                 # 记录并打印跳过信息
                 for skipped in newly_skipped_records:
                     if skipped.spine_id:
-                        print(f"{progress_prefix} ID: {student_id} -> Spine ID {skipped.spine_id} 已跳过 ({skipped.reason})")
+                        logging.info(f"{progress_prefix} ID: {student_id} -> Spine ID {skipped.spine_id} 已跳过 ({skipped.reason})")
                     else:
-                        print(f"{progress_prefix} ID: {student_id} -> 已跳过 ({skipped.reason})")
+                        logging.info(f"{progress_prefix} ID: {student_id} -> 已跳过 ({skipped.reason})")
                 skipped_records.extend(newly_skipped_records)
+        
+        # 输出统计信息
+        logging.info("-" * 40)
+        logging.info(f"学生数据请求: {client.student_req_count}")
+        logging.info(f"Spine 数据请求: {client.spine_req_count}")
 
 
     # 按 file_id 排序以保证输出顺序稳定
