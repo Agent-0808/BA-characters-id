@@ -265,43 +265,10 @@ class DataParser:
         "kr": ("family_name_kr", "given_name_kr", "", False), # KR 不包含皮肤
     }
 
-    def _get_spine_skip_reason(self, spine_item: dict[str, Any]) -> str | None:
-        """
-        检查单个 spine 数据，如果应跳过则返回原因，否则返回 None。
-        """
-        if not spine_item or not (name := spine_item.get("name")):
-            return "缺少名称或数据无效"
-
-        # 统一转换为小写以进行不区分大小写的比较
-        name_lower = name.lower()
-
-        # 只接受spr类型
-        ACCEPT_TYPES = ["spr"]
-        if (type_ := spine_item.get("type")) not in ACCEPT_TYPES:
-            return f"类型 ({type_})"
-        
-        # 跳过包含特定关键词的形态
-        SPINE_KEYWORDS_TO_SKIP: Final[list[str]] = [
-            "toschool"
-        ]
-        for keyword in SPINE_KEYWORDS_TO_SKIP:
-            if keyword in name_lower:
-                return f"包含 ({keyword})"
-
-        # 跳过特定后缀的形态
-        SPINE_SUFFIXES_TO_SKIP: Final[list[str]] = [
-            "_cn", "_steam", "_glitch_spr", "_cbt", "_old", "_update", "_halofix"
-        ]
-        for suffix in SPINE_SUFFIXES_TO_SKIP:
-            if name_lower.endswith(suffix):
-                return f"后缀 ({suffix.removeprefix('_')})"
-
-        return None
+    # Student ID / 整体数据层面的处理 (最顶层验证与基础工具)
 
     def _validate_and_get_skip_reason(self, char_data: dict | None) -> str | None:
-        """
-        对JSON数据进行预检查，如果应跳过则返回原因，否则返回None。
-        """
+        """对JSON数据进行预检查（检查 ID、School 等整体属性）"""
         if not char_data or 'data' not in char_data:
             return "数据无效或缺少 'data' 键"
 
@@ -320,88 +287,161 @@ class DataParser:
         return None
 
     def _build_name(self, family: str | None, given: str | None) -> str:
-        """根据姓和名构建全名"""
+        """基础工具：根据姓和名构建全名"""
         family_name = family or ""
         given_name = given or ""
         if family_name:
             return f"{family_name} {given_name}".strip()
         return given_name
 
+    # File ID 层面的处理 (标识符标准化)
+
     def _normalize_file_id(self, file_id: str) -> str:
         """
         标准化文件ID格式：
-        - 移除 'J_' 前缀
-        - 移除 '_spr' 后缀
-        - CH/NP 类统一使用大写
-        - 其他类统一使用小写
+        - 优先提取标准的 CHxxxx / NPxxxx 格式
+        - 移除 new_, old_ 前缀和 _spr 等后缀
         """
-        # 移除 'J_' 前缀
-        if file_id.startswith('J_'):
-            file_id = file_id.removeprefix('J_')
+        # 1. 尝试直接提取标准格式 (CH/NP + 4位数字)
+        if match := re.search(r"(CH|NP)\d{4}", file_id, re.IGNORECASE):
+            return match.group(0).upper()
 
-        # 移除 '_spr' 后缀
-        if file_id.endswith('_spr'):
-            file_id = file_id[:-4]  # 移除 "_spr"
+        # 2. 否则手动清洗
+        cleaned_id = file_id.strip()
+        for prefix in ['J_', 'new_', 'old_']:
+            if cleaned_id.lower().startswith(prefix.lower()):
+                cleaned_id = cleaned_id[len(prefix):]
 
-        # 检查是否以CH或NP开头，并且后面跟着4个数字
-        if re.match(r"^(CH|NP)\d{4}$", file_id, re.IGNORECASE):
-            return file_id.upper()
-        return file_id.lower()
+        for suffix in ['_spr', '_spr_update']:
+            if cleaned_id.endswith(suffix):
+                cleaned_id = cleaned_id.removesuffix(suffix)
+            
+        return cleaned_id.lower()
 
-    def _process_spine_remark(self, remark: str | None, base_skin: str | None) -> str:
+    # Spine ID / 皮肤层面的处理 (跳过判断、正则清洗、名称组装)
+
+    def _get_spine_skip_reason(self, spine_item: dict[str, Any]) -> str | None:
         """
-        处理 Spine 备注信息
+        检查单个 spine 数据，如果应跳过则返回原因，否则返回 None。
+        """
+        if not spine_item or not (name := spine_item.get("name")):
+            return "缺少名称或数据无效"
+
+        name_lower = name.lower()
+
+        # 只接受spr类型
+        ACCEPT_TYPES = ["spr"]
+        if (type_ := spine_item.get("type")) not in ACCEPT_TYPES:
+            return f"类型 ({type_})"
+        
+        # 跳过包含特定关键词的形态
+        SPINE_KEYWORDS_TO_SKIP: Final[list[str]] = ["toschool", "minori", "ui_raidboss"]
+        for keyword in SPINE_KEYWORDS_TO_SKIP:
+            if keyword in name_lower:
+                return f"包含 ({keyword})"
+
+        # 跳过特定后缀的形态
+        SPINE_SUFFIXES_TO_SKIP: Final[list[str]] = [
+            "_cn", "_steam", "_glitch_spr", "_cbt", "_halofix", "spr-2", "_old"
+        ]
+        for suffix in SPINE_SUFFIXES_TO_SKIP:
+            if name_lower.endswith(suffix):
+                return f"后缀 ({suffix.removeprefix('_')})"
+
+        return None
+
+    def _process_spine_remark(self, remark: str | None, base_skin: str | None, name: str | None = None) -> str:
+        """
+        处理 Spine 备注信息（核心正则清洗逻辑）
         """
         if not remark:
             return ""
 
-        # "初始立绘" 直接忽略
-        if "初始立绘" in remark: return ""
-
-        # 去除后缀
         processed = remark
-        suffixes = ["立绘", "差分"]
-        for suffix in suffixes:
-            processed = processed.removesuffix(suffix)
+
+        # 正则清洗规则列表
+        patterns = [
+            r"初始立绘",
+            r"立绘",
+            r"差分",
+            
+            # 强力清除：只要括号里包含类似年份或日期的数字结构，直接删掉整个括号
+            # 匹配：括号 -> 非括号内容 -> 2到4位数字接"年"或"." -> 非括号内容 -> 括号
+            # 这能搞定 (23.11.08之前), (2023年1月前)
+            r"[\(（][^\)）]*?\d{2,4}[年\.][^\)）]*?[\)）]",
+
+            # 清除裸露的日期串，并强制匹配后面的方位词
+            # 匹配：数字 -> 年/. -> 数字 -> [月/.] -> [日] -> [空格] -> [之前/之后/前/后/更新/版本修改]
+            r"\d{2,4}[年\.-]\d{1,2}[月\.-]\d{0,2}日?\s*(?:之?[前后]|更新|版本修改)?",
+
+            # 清除特定的状态词
+            r"[\(（](?:已)?更新至实装[\)）]",
+            r"修正版?",
+            r"更新",
+            r"(?i)\b(old|new|fixed|ver\.?\d*)\b",
+
+            # 删除 "旧" 和 "新"
+            r"[旧新]",
+
+            # 删除空括号
+            r"[\(（][\)）]",
+        ]
+
+        for pat in patterns:
+            processed = re.sub(pat, "", processed)
+
+        # 后处理：清理因删除单词留下的标点符号
+        processed = processed.replace("()", "").replace("（）", "").strip()
+        
+        # 移除开头和结尾的逗号/空格
+        processed = processed.strip(",， ")
+        # 移除中间可能出现的双逗号
+        processed = re.sub(r"[,，]\s*[,，]", ",", processed)
+        # 括号改为逗号分隔，例如"冬装（无围巾）"→"冬装,无围巾"
+        processed = re.sub(r"[\(（]\s*([^)）]+?)\s*[\)）]", r",\1", processed)
+        processed = processed.strip(",，")
+        
+        # 特定替换规则列表
+        replacement_rules = [
+            (r"礼服(?:日奈|亚子)", "礼服"),
+            ("西服", "西装"),
+        ]
+        
+        # 应用替换规则
+        for pattern, replacement in replacement_rules:
+            processed = re.sub(pattern, replacement, processed)
 
         # 如果处理后的备注与该角色的基础皮肤名一致，则不重复添加
         if base_skin and processed == base_skin:
             return ""
+        # 如果处理后的备注与角色名相同，也不添加
+        if name and processed == name:
+            return ""
 
         return processed
 
-    def _build_formatted_name(
-        self, 
-        data: dict, 
-        lang_key: str, 
-        spine_remark: str
-    ) -> str:
-        """
-        通用方法：根据语言配置构建最终名称（姓名 + 皮肤后缀）
-        """
+    def _build_formatted_name(self, data: dict, lang_key: str, spine_remark: str) -> str:
+        """根据语言配置构建最终名称"""
         fam_key, giv_key, skin_key, include_skin = self._LANG_CONFIG[lang_key]
         
-        # 1. 构建基础姓名
+        # 构建基础姓名
         base_name = self._build_name(data.get(fam_key), data.get(giv_key))
         
         # 如果连名字都没有（比如CN名字为空），直接返回空字符串
         if not base_name:
             return ""
 
-        # 2. 如果该语言不需要皮肤（如EN/KR），直接返回姓名
+        # 如果该语言不需要皮肤（如EN/KR），直接返回姓名
         if not include_skin:
             return base_name
 
-        # 3. 处理皮肤名称
+        # 处理皮肤名称
         base_skin = data.get(skin_key) or ""
-        
-        # 调用统一的处理函数处理 spine_remark
-        processed_remark = self._process_spine_remark(spine_remark, base_skin)
+        processed_remark = self._process_spine_remark(spine_remark, base_skin, base_name)
         
         skin_parts = []
         if base_skin:
             skin_parts.append(base_skin)
-        
         if processed_remark:
             skin_parts.append(processed_remark)
         
@@ -411,28 +451,32 @@ class DataParser:
             return f"{base_name}（{final_skin}）"
         return base_name
 
+    # Entry Point
+
     def parse(self, json_data: dict, kivo_wiki_id: int, spine_data: list[dict[str, Any]]) -> tuple[
         list[StudentForm], list[SkippedRecord], str | None]:
         """
-        解析单个JSON响应。
-        返回 (StudentForm列表, SkippedRecord列表, 学生级别的跳过原因 | None)。
+        主解析入口：
+        1. 验证 Student 数据
+        2. 遍历 Spine 数据
+        3. 清洗 File ID 和 Spine Remark
+        4. 生成最终结果
         """
         if skip_reason := self._validate_and_get_skip_reason(json_data):
             return [], [], skip_reason
 
         data = json_data['data']
-        results: list[StudentForm] = []
+        # 使用字典去重，key为标准化后的file_id
+        forms_map: dict[str, StudentForm] = {}
         skipped_spines: list[SkippedRecord] = []
-        processed_file_ids: set[str] = set()
 
-        # 预先获取用于 SkippedRecord 的基础信息 (使用 default/jp 逻辑)
+        # 预先计算基础名称，用于 SkippedRecord
         base_name_jp = self._build_name(data.get("family_name_jp"), data.get("given_name_jp"))
         base_name_en = self._build_name(data.get("family_name_en"), data.get("given_name_en"))
-        # 默认 name 用于记录
         default_name = self._build_name(data.get("family_name"), data.get("given_name"))
 
-        # 从 spine 数据提取 file_id
         for spine_item in spine_data:
+            # 3.1 检查 Spine 是否跳过
             if skip_reason := self._get_spine_skip_reason(spine_item):
                 skipped_spines.append(SkippedRecord(
                     student_id=kivo_wiki_id,
@@ -448,38 +492,30 @@ class DataParser:
                 continue
 
             spine_name_raw = spine_item["name"]
+            # 处理 File ID
             file_id = self._normalize_file_id(spine_name_raw)
             
-            if not file_id or file_id in processed_file_ids:
+            if not file_id:
                 continue
 
             # 获取 Spine 备注
             spine_id = spine_item.get("id")
             spine_remark = spine_item.get("remark", "")
 
-            # --- 构建各语言名称 ---
-            # 使用字典推导式一次性生成所有需要的名称字段
-            # map key (e.g., 'cn') -> formatted name string
+            # 3.3 处理各种语言的名称 (内部调用 _process_spine_remark)
             names = {
                 key: self._build_formatted_name(data, key, spine_remark)
                 for key in self._LANG_CONFIG
             }
 
-            # 计算 skin_name (仅用于 skin_name 字段，逻辑同 default 但只取括号内部分)
-            # 这里复用一下逻辑，手动构建
+            # 单独计算 skin_name 字段
             base_skin = data.get("skin") or ""
-            # 调用统一的处理函数处理 spine_remark
-            processed_remark = self._process_spine_remark(spine_remark, base_skin)
-
-            skin_parts = []
-            if base_skin:
-                skin_parts.append(base_skin)
-            if processed_remark:
-                skin_parts.append(processed_remark)
-                
+            processed_remark = self._process_spine_remark(spine_remark, base_skin, default_name)
+            # 使用推导式构建列表，自动过滤空字符串
+            skin_parts = [s for s in [base_skin, processed_remark] if s]
             final_skin_str = ",".join(skin_parts)
 
-            results.append(StudentForm(
+            form = StudentForm(
                 file_id=file_id,
                 char_id=kivo_wiki_id,
                 spine_id=spine_id,
@@ -491,8 +527,19 @@ class DataParser:
                 name_tw=names["tw"],
                 name_en=names["en"],
                 name_kr=names["kr"]
-            ))
-            processed_file_ids.add(file_id)
+            )
+
+            # --- 去重与合并逻辑 ---
+            if file_id in forms_map:
+                existing_form = forms_map[file_id]
+                # 简单的“后者优先”策略：假设 spine_id 越大代表版本越新
+                # 这样新版（ID大）会覆盖旧版（ID小）
+                if (spine_id or 0) > (existing_form.spine_id or 0):
+                    forms_map[file_id] = form
+            else:
+                forms_map[file_id] = form
+
+        results = list(forms_map.values())
 
         if not results and not skipped_spines:
             return [], [], "未找到可解析的角色形态"
